@@ -1,0 +1,541 @@
+#!/usr/bin/python
+#
+# This is a small program which performs ip lookup on a list of hostnames and stores them in an sqlite database (defaults to /usr/share/iplook/address.db).
+#
+
+from sqlalchemy import create_engine
+from sqlalchemy import Table, Column, Integer, String, MetaData, ForeignKey
+from sqlalchemy.orm import mapper, sessionmaker, relation, join
+from sqlalchemy.databases import mysql
+
+import logging
+import socket
+
+metadata = MetaData()
+
+ip_table = Table('ipl_ip', metadata,
+  Column('id', Integer, primary_key=True),
+  Column('network', mysql.MSInteger(unsigned=True)),
+  Column('hostmask', Integer(), default=0)
+);
+
+ip_to_host_table = Table('ipl_ip_to_host', metadata,
+  Column('id', Integer, primary_key=True),
+  Column('ip_id', Integer, ForeignKey('ipl_ip.id')),
+  Column('host_id', Integer, ForeignKey('ipl_host.id'))
+);
+
+host_table = Table('ipl_host', metadata,
+  Column('id', Integer, primary_key=True),
+  Column('host', String(128))
+)
+
+note_table = Table('ipl_note', metadata,
+  Column('id', Integer, primary_key=True),
+  Column('note', String(128)),
+  Column('host_id', Integer, ForeignKey('ipl_host.id'))
+)
+
+class Ip(object):
+  def __init__(self, network=None, hostmask=None):
+    self.network = network;
+    self.hostmask = hostmask;
+  
+  def add_host(self, session, host):
+    self.hosts.append(Host(host=host));
+
+  #def add_note(self, session, note):
+  #  session.add(Note(note=note, ip_rel=self));
+  
+  def del_host(self, session, host):
+    session.query(Host).filter(Host.host==host).filter(Host.ip_rel_id==self.id).delete();
+  
+  def del_note(self, session, note_id):
+    session.query(Note).filter(Note.id==note_id).delete();
+  
+  def get_hosts(self, session):
+    return map(lambda h: h.host, self.hosts)
+    #session.query(Host).filter(Host.ip_rel_id==self.id).all());
+  
+  def get_notes(self, session):
+    return self.hosts.notes#session.query(Note).filter(Note.ip_rel_id==self.id).all()
+  
+  def drop_hosts(self, session):
+    session.query(Host).filter(Host.ip_rel_id == self.id).delete();
+  
+  def drop_notes(self, session):
+    session.query(Note).filter(Note.ip_rel_id == self.id).delete();
+
+  def to_str(self):
+    import math
+    import ipaddr
+    
+    ip = ipaddr.IPv4(self.network)
+    if self.hostmask != 0:
+      ip = ip.supernet(int(math.log(self.hostmask + 1) / math.log(2)))
+      return ip
+    else:
+      return ip.ip_ext
+
+class Host(object):
+  def __init__(self, host=None):
+    self.host = host
+  
+  def get_ips(self, session):
+    return map(lambda ip: ip.to_str(), self.ips)
+
+class Note(object):
+  def __init__(self, ip_rel=None, note=None):
+    if ip_rel:
+      self.ip_rel_id = ip_rel.id;
+    self.note = note
+
+class ArgumentError(Exception):
+  pass;
+
+def subnet_query(session, ip_low, ip_high):
+  return session.query(Ip).filter(Ip.network.__ge__(ip_low)).filter(Ip.network.__le__(ip_high)).order_by(Ip.network)
+
+def db_setup(path, engine):
+  """
+  performs database setup when needed (e.g. no database file).
+  """
+  import os
+  
+  if not os.path.isfile(path):
+    metadata.create_all(engine)
+  
+  logging.debug("Database (%s) OK!"%(path))
+
+def mapper_setup():
+  """
+  creating object-relational mappings
+  """
+  mapper(Ip, ip_table)
+
+  mapper(Host, host_table, {
+    'ips': relation(Ip, secondary=ip_to_host_table, backref='hosts', cascade='all, delete'),
+    'notes': relation(Note)
+  })
+  
+  mapper(Note, note_table)
+  
+  logging.debug("Mapper OK!")
+
+def create_session(engine):
+  """
+  create our session
+  """
+  Session = sessionmaker()
+  Session.configure(bind=engine)
+
+  logging.debug("Session OK!")
+  
+  return Session()
+
+def help():
+  print "usage: iplook <action> [action-args]"
+  print "  available actions:"
+  print "    load : load addresses from file"
+  print "     put : create a single address space"
+  print " refresh : try to refresh an existing host, do not create one if it does not exist"
+  print "     get : get a address space"
+  print "  delete : delete a address space"
+  print "    help : help about a specific topic"
+  return 1
+
+def load_help():
+  print "usage: iplook load <file>"
+  print "  loads a bunch of hosts from a file"
+  print "  the <file> is a space separated file like this:"
+  print "    <host>\\n"
+  return 1
+
+def put_help():
+  print "usage: iplock put <host> <ip>"
+  print "  if you put an existing <ip>, the hostname will be added to that <host> relation of ips"
+  return 1
+
+def get_help():
+  print "usage: iplock get <ip>"
+  print "  <ip> could be any valid ipv4-address with netmask"
+  print "  like: 83.168.207.168/24"
+  return 1
+
+def delete_help():
+  print "usage: iplock delete <ip|id:42>"
+  print "  <ip> could be any valid ipv4-address with netmask"
+  print "  like: 83.168.207.168/24"
+  print ""
+  print "  A single ip-address will remove a single record."
+  print "  An ip-address with netmask will remove an entire address space."
+  print "  It is possible to specify address id with the following format as argument:"
+  print "    id:<id>"
+  print "  The id's are available when <get>'ting or <list>'ing rows."
+  return 1
+
+def refresh_help():
+  print "usage: iplock refresh <hostname>"
+  print "  <hostname> could be any valid dns-resolutable hostname"
+  print "  like: google.se"
+  print ""
+  print "  Tries to resolute an _existing_ hostname to an ip-address and make sure that database is fresh"
+  print "  note: hostname must exist in database for this to work"
+  return 1
+
+def act_load(argv, session):
+  if len(argv) < 1:
+    return load_help();
+  
+  import ipaddr
+  
+  fp = open(argv[0], "r")
+
+  for line in fp.readlines():
+    host = line.strip()
+    
+    if ' ' in host:
+      host, ip, _ = host.split(' ')
+      ip = ip.strip()
+      host = host.strip()
+      act_put([host, ip], session)
+    else:
+      act_put([host], session)
+  
+  return 0;
+  
+def act_list(argv, session, qry=None, is_host=False):
+  import ipaddr
+  import math
+  
+  if not qry:
+    qry = session.query(Ip).order_by(Ip.network)
+  
+  if is_host:
+    logging.info("listing %d hostnames", qry.count())
+
+    for host in qry.all():
+      hostname = host.host
+      linefill = " " * 20
+      
+      print "%20s %s"%(hostname, (",\n%s "%(linefill)).join(host.get_ips(session)))
+  else:
+    logging.info("listing %d ip-addresses", qry.count())
+    linefill = " " * 20
+    
+    for ipr in qry.all():
+      print "%20s %s"%(ipr.to_str(), (",\n%s "%(linefill)).join(ipr.get_hosts(session)))
+
+    #for note in ipr.get_notes(session):
+    #  print "                                 N%04d: %s"%(note.id, note.note)
+  
+  return 0;
+
+def act_put(argv, session):
+  if len(argv) < 1 or len(argv) > 2:
+    return put_help();
+  
+  import ipaddr
+  
+  if len(argv) == 2:
+    host = argv[0]
+    ip = ipaddr.IPv4(argv[1])
+
+    hostr = session.query(Host).filter(Host.host==host).first()
+    
+    if not hostr:
+      logging.debug("host does not exist, creating one...")
+      hostr = Host(host=host)
+      session.add(hostr)
+      session.commit()
+    
+    ipr = session.query(Ip).filter(Ip.network == ip.network).first()
+    
+    if not ipr:
+      ipr = Ip(network=ip.network, hostmask=ip.hostmask)
+    
+    hostr.ips.append(ipr)
+  else:
+    host = argv[0]
+    
+    hostr = session.query(Host).filter(Host.host==host).first()
+    
+    if not hostr:
+      logging.debug("host does not exist, creating one...")
+      hostr = Host(host=host)
+      session.add(hostr)
+      session.commit()
+    
+    return act_refresh([host], session)
+  
+  return 0;
+
+def act_get(argv, session):
+  if len(argv) < 1:
+    return get_help();
+  
+  import ipaddr
+  
+  is_host, qry = parse_query(session, argv[0])
+  return act_list(None, session, qry, is_host)
+
+def act_delete(argv, session):
+  if len(argv) < 1:
+    return delete_help()
+
+  import ipaddr
+  is_host, qry = parse_query(session, argv[0])
+
+  if len(argv) == 1:
+    # removing single
+    
+    if is_host:
+      logging.info("deleting %d host records"%(qry.count()))
+    else:
+      logging.info("deleting %d ip-address records"%(qry.count()))
+    
+    qry.delete()
+  else:
+    if not is_host:
+      logging.error("First argument must be hostname")
+      return 1
+    
+    is_host_2, qry_2 = parse_query(session, argv[1])
+    
+    if is_host_2:
+      logging.error("Second argument must be ip-address")
+      return 1
+    
+    #users.delete().where(users.c.name > 'm')
+
+    # removing relation
+    logging.info("modifying %d records (removing hosts)"%(qry.count()))
+
+def act_delete_note(argv, session):
+  if len(argv) < 1:
+    return delete_help()
+
+  note_id = None
+  if len(argv) > 1:
+    note_id = int(argv[1])
+  
+  import ipaddr
+  
+  qry = parse_query(session, argv[0])
+  
+  for ipr in qry:
+    if note_id:
+      ipr.del_note(session, note_id)
+    else:
+      ipr.drop_notes(session)
+  
+  return 0;
+
+def act_update(argc, engine):
+  metadata.create_all(engine)
+  return 0
+
+def act_put_note(argv, session):
+  if len(argv) < 2:
+    return get_help();
+  
+  import ipaddr
+  
+  qry = parse_query(session, argv[0])
+  
+  for ipr in qry.all():
+    ipr.add_note(session, ' '.join(argv[1:]).decode('utf-8'));
+  
+  return 0
+
+def act_refresh(argv, session):
+  
+  import socket, ipaddr
+  
+  if len(argv) < 1:
+    hostname = '%'
+  else:
+    hostname = argv[0]
+  
+  for host in session.query(Host).filter(Host.host.like(hostname + "%")).all():
+    logging.info("Refreshing %s..."%(host.host))
+    
+    #if session.query(Ip).with_parent(host).count() > 0:
+    #  continue
+
+    ip_addresses = list();
+    ip_addresses_delete = list();
+    
+    try:
+      addresses = socket.getaddrinfo(host.host, None)
+    except socket.gaierror:
+      logging.info("  does not exist (might wan't to delete?)")
+      continue
+    
+    for addrtuple in addresses:
+      family, socktype, proto, canonname, sockaddr = addrtuple
+      
+      if family != socket.AF_INET:
+        continue
+
+      if socktype != socket.SOCK_DGRAM:
+        continue
+      
+      ip = sockaddr[0]
+      ipp = ipaddr.IPv4(ip)
+      
+      ip_addresses.append(ipp.network)
+    
+    for ip in session.query(Ip).with_parent(host).all():
+      if ip.network in ip_addresses:
+        ip_addresses.remove(ip.network)
+      else:
+        ip_addresses_delete.append(ip.id)
+    
+    if len(ip_addresses_delete) > 0:
+      logging.info("  Deleting %d ip-addresses"%(len(ip_addresses_delete)))
+    
+    if len(ip_addresses) > 0:
+      logging.info("  Adding %d ip-addresses"%(len(ip_addresses)))
+
+    if len(ip_addresses) == 0 and len(ip_addresses_delete) == 0:
+      logging.info("  Nothing to do")
+    
+    for network in ip_addresses:
+      ipr = session.query(Ip).filter(Ip.network == network).first()
+      
+      if not ipr:
+        ipr = Ip(network=network)
+      
+      host.ips.append(ipr);
+    
+    session.query(Ip).filter(Ip.id.in_(ip_addresses_delete)).delete();
+    
+    session.commit();
+    logging.info("...All done!")
+  
+  return 0
+
+def parse_query(session, id):
+  """
+  Creates an sql expression query for a couple of ip-addresses or strings.
+  """
+  import ipaddr
+  
+  try:
+    ip = ipaddr.IPv4(id)
+    ip_low, ip_high = ip[0], ip[-1]
+    
+    return False, subnet_query(session, ip.network, ip.network + ip.hostmask)
+  except:
+    return True, session.query(Host).filter(Host.host.like(id + "%"))
+
+def main_config(conf):
+  import os
+
+  if not os.path.isfile(conf):
+    print "First time running... configuring"
+    
+    connstr = None;
+    engine = None;
+    
+    while True:
+      sys.stdout.write("Please enter a valid sqlalchemy connection string: ");
+      connstr = sys.stdin.readline();
+      
+      try:
+        engine = create_engine(connstr)
+      except Exception, e:
+        logging.error(str(e));
+        continue;
+      
+      break;
+
+    f = open(conf, 'w');
+    f.write(connstr);
+    f.close();
+    return engine;
+  else:
+    f = open(conf, 'r')
+    connstr = f.read();
+    f.close();
+    
+    engine = None;
+    
+    try:
+      engine = create_engine(connstr)
+    except Exception, e:
+      logging.error(str(e));
+      os.path.unlink(conf);
+      logging.info("Removing old configuration")
+      return main_config(conf);
+    
+    return engine;
+
+def main(argv):
+  import os
+  import sys
+
+  global metadata
+  
+  conf = os.path.expanduser("~/.iplook");
+  
+  if len(argv) <= 0:
+    return help();
+  
+  act = argv[0]
+  
+  engine = main_config(conf);
+  
+  #creates all, if necessary
+  metadata.create_all(engine)
+  
+  #db_setup(db_path, engine)
+  mapper_setup()
+  session = create_session(engine);
+  
+  ret = 0;
+  
+  if act == "load":
+    ret = act_load(argv[1:], session);
+  elif act == "put":
+    ret = act_put(argv[1:], session);
+  elif act == "put-note":
+    ret = act_put_note(argv[1:], session);
+  elif act == "delete":
+    ret = act_delete(argv[1:], session);
+  elif act == "delete-note":
+    ret = act_delete_note(argv[1:], session);
+  elif act == "get":
+    ret = act_get(argv[1:], session);
+  elif act == "get-host":
+    ret = act_get_host(argv[1:], session);
+  elif act == "list":
+    ret = act_list(argv[1:], session);
+  elif act == "assign":
+    ret = act_assign(argv[1:], session);
+  elif act == "refresh":
+    ret = act_refresh(argv[1:], session);
+  elif act == "update":
+    ret = act_update(argv[1:], engine);
+  elif act == "help":
+    return help();
+  else:
+    print "unknown <action>"
+    return help();
+  
+  session.commit();
+  return ret
+
+if __name__ == "__main__":
+  import sys
+
+  #level_name = sys.argv[1]
+  #level = LEVELS.get(level_name, logging.NOTSET)
+  logging.basicConfig(level=logging.INFO)
+  
+  #try:
+  sys.exit(main(sys.argv[1:]))
+  #except Exception, e:
+  #  logging.error(str(e))
+  #  raise e
